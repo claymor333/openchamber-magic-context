@@ -1,0 +1,38 @@
+{
+  "name": "openchamber-magic-context",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "build": "bunx openchamber-guest-bundle panel/main.ts panel/main.js && bunx openchamber-guest-bundle --node service/main.ts service/main.js",
+    "type-check": "tsc --noEmit",
+    "test": "node --import tsx --test service/diagnostics.test.ts",
+    "verify": "bun run build && bun run type-check && bun run test"
+  },
+  "devDependencies": {
+    "@openchamber/sdk": "1.24.2",
+    "@types/node": "^22.18.0",
+    "tsx": "^4.20.6",
+    "typescript": "~5.9.0",
+    "zod": "^4.3.6"
+  },
+  "openchamber": {
+    "apiVersion": 1,
+    "engines": { "openchamber": ">=1.24.0" },
+    "contributes": {
+      "panel": {
+        "id": "magic-context-sidebar",
+        "name": "Magic Context",
+        "icon": "apps",
+        "entry": "panel/index.html"
+      },
+      "service": {
+        "entry": "service/main.js",
+        "runtime": "host"
+      }
+    }
+  }
+}
