@@ -1,25 +1,19 @@
-import fs from 'node:fs/promises';
 import { stat } from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 import type { DatabaseSync as DatabaseSyncType, SQLInputValue, SQLOutputValue } from 'node:sqlite';
 import * as z from 'zod/mini';
+import { defaultDataPaths, type DataPaths } from './config.js';
+import { readLiveSidebar } from './magic-context-rpc.js';
 import type {
   CacheCause,
   CacheEvent,
   DatabaseDiagnostics,
   DiagnosticsResponse,
-  LogDiagnostics,
+  ProviderStatus,
+  SourceId,
   SourceState,
-  StreamEvent,
 } from '../shared.js';
 
-const MAX_LOG_BYTES = 256 * 1024;
-const MAX_LOG_LINES = 100;
 const MAX_CACHE_ROWS = 50;
-const CONTEXT_DB = path.join('.local', 'share', 'cortexkit', 'magic-context', 'context.db');
-const OPENCODE_DB = path.join('.local', 'share', 'opencode', 'opencode.db');
-const LOG_PATH = path.join('opencode', 'magic-context', 'magic-context.log');
 const MESSAGE_TABLES = ['message', 'session_message'] as const;
 const COUNT_TABLES = ['compartments', 'memories', 'pending_ops', 'notes'] as const;
 const USAGE_COLUMNS = [
@@ -32,7 +26,13 @@ const USAGE_COLUMNS = [
 type SqliteModule = typeof import('node:sqlite');
 type OpenCodeCacheEvent = { messageId: string | null; event: CacheEvent };
 type OpenCodeCacheEvents = { state: SourceState; lastInputTokens: number | null; events: OpenCodeCacheEvent[] };
-type ContextDatabaseResult = { diagnostics: DatabaseDiagnostics['magicContext']; causes: Map<string, CacheCause> };
+type ContextDatabaseResult = {
+  state: SourceState;
+  counts: DatabaseDiagnostics['magicContext']['counts'];
+  context: DatabaseDiagnostics['magicContext']['context'];
+  causes: Map<string, CacheCause>;
+  transformDecisionsCapability: ProviderStatus['capabilities'][number]['state'];
+};
 
 const sqliteNumberSchema = z.union([
   z.number(),
@@ -41,11 +41,7 @@ const sqliteNumberSchema = z.union([
 ]);
 const sqliteStringSchema = z.string().check(z.minLength(1));
 
-export type DataPaths = {
-  magicContext: string;
-  openCode: string;
-  log: string;
-};
+export type { DataPaths };
 
 let sqliteModulePromise: Promise<SqliteModule | null> | null = null;
 
@@ -61,11 +57,7 @@ const fileState = (filePath: string): Promise<SourceState> => new Promise((resol
   });
 });
 
-export const resolveDataPaths = (home = os.homedir(), temp = os.tmpdir()): DataPaths => ({
-  magicContext: path.join(home, CONTEXT_DB),
-  openCode: path.join(home, OPENCODE_DB),
-  log: path.join(temp, LOG_PATH),
-});
+export const resolveDataPaths = defaultDataPaths;
 
 const finiteNumber = (value: SQLOutputValue | undefined): number | null => {
   const parsed = sqliteNumberSchema.safeParse(value);
@@ -149,14 +141,14 @@ const countRows = (database: DatabaseSyncType, table: string, sessionId: string 
   return finiteNumber(result?.count);
 };
 
-const usageFromContextDb = (database: DatabaseSyncType, sessionId: string | null): DatabaseDiagnostics['magicContext']['context'] | undefined => {
-  if (!sessionId) return undefined;
+const usageFromContextDb = (database: DatabaseSyncType, sessionId: string | null): DatabaseDiagnostics['magicContext']['context'] => {
+  if (!sessionId) return null;
   const tables = tableNames(database);
-  if (!tables.has('session_meta')) return undefined;
+  if (!tables.has('session_meta')) return null;
   const columns = tableColumns(database, 'session_meta');
-  if (!columns.has('session_id')) return undefined;
+  if (!columns.has('session_id')) return null;
   const selected = USAGE_COLUMNS.filter((column) => columns.has(column));
-  if (!selected.length) return undefined;
+  if (!selected.length) return null;
   const filters = [`${quoteIdentifier('session_id')} = ?`];
   const parameters: SQLInputValue[] = [sessionId];
   if (columns.has('harness')) {
@@ -165,7 +157,7 @@ const usageFromContextDb = (database: DatabaseSyncType, sessionId: string | null
   }
   const fields = selected.map(quoteIdentifier).join(', ');
   const row = database.prepare(`SELECT ${fields} FROM ${quoteIdentifier('session_meta')} WHERE ${filters.join(' AND ')} LIMIT 1`).get(...parameters);
-  if (!row) return undefined;
+  if (!row) return null;
   const usagePercent = finiteNumber(row.last_context_percentage) ?? finiteNumber(row.last_usage_percentage);
   return {
     inputTokens: finiteNumber(row.last_input_tokens),
@@ -175,9 +167,9 @@ const usageFromContextDb = (database: DatabaseSyncType, sessionId: string | null
 };
 
 const contextDatabase = async (filePath: string, sessionId: string | null, messageIds: string[], sqlite: SqliteModule | null): Promise<ContextDatabaseResult> => {
-  if (!sqlite) return { diagnostics: { state: 'unsupported' }, causes: new Map() };
+  if (!sqlite) return { state: 'unsupported', counts: null, context: null, causes: new Map(), transformDecisionsCapability: 'unsupported' };
   const pathState = await fileState(filePath);
-  if (pathState !== 'ready') return { diagnostics: { state: pathState }, causes: new Map() };
+  if (pathState !== 'ready') return { state: pathState, counts: null, context: null, causes: new Map(), transformDecisionsCapability: 'unavailable' };
   let database: DatabaseSyncType | null = null;
   try {
     database = new sqlite.DatabaseSync(filePath, { readOnly: true });
@@ -192,11 +184,23 @@ const contextDatabase = async (filePath: string, sessionId: string | null, messa
     const context = usageFromContextDb(database, sessionId);
     const causes = readDecisionCauses(database, sessionId, messageIds);
     const anyTable = COUNT_TABLES.some((table) => tables.has(table)) || tables.has('session_meta');
-    const result: DatabaseDiagnostics['magicContext'] = { state: anyTable ? 'ready' : 'partial', counts };
-    if (context) result.context = context;
-    return { diagnostics: result, causes };
+    let transformDecisionsCapability: ProviderStatus['capabilities'][number]['state'] = 'unsupported';
+    if (tables.has('transform_decisions')) {
+      const columns = tableColumns(database, 'transform_decisions');
+      const hasDecisionFields = ['decision', 'materialize_reason', 'emergency'].some((column) => columns.has(column));
+      transformDecisionsCapability = columns.has('session_id') && columns.has('message_id') && hasDecisionFields
+        ? 'available'
+        : 'partial';
+    }
+    return {
+      state: anyTable ? 'ready' : 'partial',
+      counts,
+      context,
+      causes,
+      transformDecisionsCapability,
+    };
   } catch {
-    return { diagnostics: { state: 'error' }, causes: new Map() };
+    return { state: 'error', counts: null, context: null, causes: new Map(), transformDecisionsCapability: 'unavailable' };
   } finally {
     database?.close();
   }
@@ -230,6 +234,7 @@ const readDecisionCauses = (database: DatabaseSyncType, sessionId: string | null
 };
 
 const openCodeCacheEvents = (database: DatabaseSyncType, sessionId: string | null): OpenCodeCacheEvents => {
+  if (!sessionId) return { state: 'partial', lastInputTokens: null, events: [] };
   const tables = tableNames(database);
   const table = MESSAGE_TABLES.find((name) => tables.has(name));
   if (!table) return { state: 'partial', lastInputTokens: null, events: [] };
@@ -256,12 +261,17 @@ const openCodeCacheEvents = (database: DatabaseSyncType, sessionId: string | nul
     ORDER BY ${quoteIdentifier(timeColumn)} DESC LIMIT ${MAX_CACHE_ROWS}
   `).all(...parameters);
   const events: OpenCodeCacheEvent[] = [];
+  let assistantRows = 0;
+  let usageShapeSeen = false;
   for (const row of rows) {
     if (stringValue(row.role) !== 'assistant') continue;
+    assistantRows += 1;
     const inputTokens = finiteNumber(row.input_tokens);
     const cacheRead = finiteNumber(row.cache_read);
     const cacheWrite = finiteNumber(row.cache_write);
-    const totalTokens = finiteNumber(row.total_tokens) ?? [inputTokens, cacheRead, cacheWrite]
+    const rowTotalTokens = finiteNumber(row.total_tokens);
+    usageShapeSeen ||= inputTokens !== null || cacheRead !== null || cacheWrite !== null || rowTotalTokens !== null;
+    const totalTokens = rowTotalTokens ?? [inputTokens, cacheRead, cacheWrite]
       .reduce<number>((sum, value) => sum + (value ?? 0), 0);
     if (totalTokens <= 0) continue;
     const messageId = stringValue(row.message_id);
@@ -278,7 +288,11 @@ const openCodeCacheEvents = (database: DatabaseSyncType, sessionId: string | nul
       },
     });
   }
-  return { state: 'ready', lastInputTokens: events[0]?.event.inputTokens ?? null, events };
+  return {
+    state: assistantRows > 0 && !usageShapeSeen ? 'partial' : 'ready',
+    lastInputTokens: events[0]?.event.inputTokens ?? null,
+    events,
+  };
 };
 
 const openCodeDatabase = async (filePath: string, sessionId: string | null, sqlite: SqliteModule | null): Promise<OpenCodeCacheEvents> => {
@@ -297,101 +311,142 @@ const openCodeDatabase = async (filePath: string, sessionId: string | null, sqli
   }
 };
 
-const logCategory = (message: string): StreamEvent['category'] | null => {
-  const lower = message.toLowerCase();
-  if (lower.includes('dreamer')) return 'dreamer';
-  if (lower.includes('historian') || lower.includes('compart')) return 'historian';
-  if (lower.includes('transform') || lower.includes('material')) return 'transform';
-  if (lower.includes('cache') || lower.includes('tokens.input')) return 'cache';
-  if (lower.includes('session.status') || lower.includes('stream') || lower.includes('receive')
-    || lower.includes('complete') || lower.includes('event')) return 'stream';
-  return null;
+const statusFor = (source: SourceId, state: SourceState, observedAt: string, capabilities: ProviderStatus['capabilities']): ProviderStatus => ({
+  source,
+  state,
+  observedAt,
+  freshness: state === 'ready' || state === 'partial' ? 'fresh' : 'unknown',
+  ageMs: 0,
+  capabilities,
+});
+
+export const MagicContextDatabaseProvider = {
+  read: contextDatabase,
 };
 
-const parsedTime = (value: string | undefined): string | null => {
-  if (!value) return null;
-  const milliseconds = Date.parse(value);
-  return Number.isFinite(milliseconds) ? new Date(milliseconds).toISOString() : null;
+export const OpenCodeUsageProvider = {
+  read: openCodeDatabase,
 };
 
-export const parseMagicContextLogLine = (line: string): StreamEvent | null => {
-  const legacy = line.match(/^\[([^\]]+)\]\s*\[magic-context\](?:\[[^\]]+\])?\s*(.*)$/i);
-  const fleet = line.match(/^(\S+)\s+(TRACE|DEBUG|INFO|WARN|ERROR)\s+(.*)$/i);
-  const time = legacy?.[1] ?? fleet?.[1];
-  const message = legacy?.[2] ?? fleet?.[3];
-  if (!message) return null;
-  const category = logCategory(message);
-  if (!category) return null;
-  const numberIn = (name: string): number | null => {
-    const match = message.match(new RegExp(`(?:${name})\\s*[=: ]\\s*(\\d+)`, 'i'));
-    return match ? Number(match[1]) : null;
-  };
-  const level = fleet?.[2]?.toLowerCase();
-  const normalizedLevel: StreamEvent['level'] = level === 'trace' || level === 'debug' || level === 'warn' || level === 'error'
-    ? level
-    : 'info';
-  return {
-    at: parsedTime(time),
-    level: normalizedLevel,
-    category,
-    inputTokens: numberIn('tokens(?:\\.input| input)'),
-    cacheRead: numberIn('cache(?:\\.read| read)'),
-    cacheWrite: numberIn('cache(?:\\.write| write)'),
-  };
-};
+export const emptyDatabaseDiagnostics = (): DatabaseDiagnostics => ({
+  magicContext: { counts: null, context: null },
+  openCode: { lastInputTokens: null, cacheEvents: [] },
+});
 
-const readLog = async (filePath: string): Promise<LogDiagnostics> => {
-  const observedAt = new Date().toISOString();
-  const pathState = await fileState(filePath);
-  if (pathState !== 'ready') return { state: pathState, observedAt, events: [] };
-  let handle: Awaited<ReturnType<typeof fs.open>> | null = null;
-  try {
-    handle = await fs.open(filePath, 'r');
-    const info = await handle.stat();
-    const byteLength = Math.min(info.size, MAX_LOG_BYTES);
-    const buffer = Buffer.alloc(byteLength);
-    if (byteLength) await handle.read(buffer, 0, byteLength, info.size - byteLength);
-    const lines = buffer.toString('utf8').split(/\r?\n/).slice(-MAX_LOG_LINES);
-    const events = lines.flatMap((line) => {
-      const event = parseMagicContextLogLine(line);
-      return event ? [event] : [];
-    });
-    return { state: 'ready', observedAt, events };
-  } catch {
-    return { state: 'error', observedAt, events: [] };
-  } finally {
-    await handle?.close();
-  }
-};
-
-export const readDiagnostics = async ({
+export const readDatabaseProviders = async ({
   sessionId,
-  includeDatabase,
-  paths = resolveDataPaths(),
+  paths,
+  sqlite: sqliteOverride,
+  now = () => new Date(),
 }: {
   sessionId: string | null;
-  includeDatabase: boolean;
-  paths?: DataPaths;
-}): Promise<DiagnosticsResponse> => {
-  const log = await readLog(paths.log);
-  const response: DiagnosticsResponse = { schemaVersion: 1, observedAt: new Date().toISOString(), log };
-  if (includeDatabase) {
-    const sqlite = await loadSqlite();
-    const openCode = await openCodeDatabase(paths.openCode, sessionId, sqlite);
-    const messageIds = openCode.events.flatMap(({ messageId }) => messageId ? [messageId] : []);
-    const context = await contextDatabase(paths.magicContext, sessionId, messageIds, sqlite);
-    response.database = {
-      observedAt: response.observedAt,
-      magicContext: context.diagnostics,
+  paths: DataPaths;
+  sqlite?: SqliteModule | null;
+  now?: () => Date;
+}): Promise<{
+  database: DatabaseDiagnostics;
+  magicContextStatus: ProviderStatus;
+  openCodeStatus: ProviderStatus;
+}> => {
+  const sqlite = sqliteOverride === undefined ? await loadSqlite() : sqliteOverride;
+  const openCode = await OpenCodeUsageProvider.read(paths.openCodeDatabase, sessionId, sqlite);
+  const messageIds = openCode.events.flatMap(({ messageId }) => messageId ? [messageId] : []);
+  const contextWithCauses = await MagicContextDatabaseProvider.read(paths.magicContextDatabase, sessionId, messageIds, sqlite);
+  const observedAt = now().toISOString();
+  const mcCountValues = contextWithCauses.counts ? Object.values(contextWithCauses.counts) : [];
+  const mcCountsCapability = contextWithCauses.state === 'unsupported'
+    ? 'unsupported'
+    : contextWithCauses.state === 'missing' || contextWithCauses.state === 'error'
+      ? 'unavailable'
+      : contextWithCauses.counts && mcCountValues.every((value) => value !== null)
+        ? 'available'
+        : 'partial';
+  const mcState = contextWithCauses.state === 'ready' && mcCountsCapability === 'available'
+    ? 'ready'
+    : contextWithCauses.state === 'ready' ? 'partial' : contextWithCauses.state;
+  const magicContextStatus = statusFor('magic-context-db', mcState, observedAt, [
+    { id: 'db.session-counts', state: mcCountsCapability },
+    { id: 'db.session-usage', state: contextWithCauses.state === 'unsupported' ? 'unsupported' : contextWithCauses.state === 'missing' || contextWithCauses.state === 'error' ? 'unavailable' : contextWithCauses.context ? 'available' : 'partial' },
+    { id: 'db.transform-decisions', state: contextWithCauses.state === 'unsupported' ? 'unsupported' : contextWithCauses.state === 'missing' || contextWithCauses.state === 'error' ? 'unavailable' : contextWithCauses.transformDecisionsCapability },
+  ]);
+  const openCodeStatus = statusFor('opencode-db', openCode.state, observedAt, [
+    { id: 'db.assistant-usage', state: openCode.state === 'ready' ? 'available' : openCode.state === 'partial' ? 'partial' : openCode.state === 'unsupported' ? 'unsupported' : 'unavailable' },
+  ]);
+  return {
+    database: {
+      magicContext: {
+        counts: contextWithCauses.counts,
+        context: contextWithCauses.context,
+      },
       openCode: {
-        state: openCode.state,
         lastInputTokens: openCode.lastInputTokens,
         cacheEvents: openCode.events.map(({ messageId, event }) => ({
           ...event,
-          cause: messageId ? context.causes.get(messageId) ?? null : null,
+          cause: messageId ? contextWithCauses.causes.get(messageId) ?? null : null,
         })),
       },
+    },
+    magicContextStatus,
+    openCodeStatus,
+  };
+};
+
+const unavailableStatus = (source: SourceId, observedAt: string): ProviderStatus => statusFor(source, 'error', observedAt, []);
+const noProjectStatus = (observedAt: string): ProviderStatus => statusFor('magic-context-rpc', 'missing', observedAt, [
+  { id: 'rpc.bearer-auth', state: 'unavailable' },
+  { id: 'rpc.sidebar-snapshot', state: 'unavailable' },
+  { id: 'rpc.status-detail', state: 'unavailable' },
+]);
+
+export const buildSnapshot = async ({
+  sessionId,
+  directory,
+  paths,
+  logStatus,
+  configurationValid = true,
+  now = () => new Date(),
+}: {
+  sessionId: string | null;
+  directory: string | null;
+  paths: DataPaths;
+  logStatus: ProviderStatus;
+  configurationValid?: boolean;
+  now?: () => Date;
+}): Promise<DiagnosticsResponse> => {
+  const observedAt = now().toISOString();
+  if (!configurationValid) {
+    return {
+      schemaVersion: 2,
+      observedAt,
+      sessionId,
+      sources: {
+        liveRpc: unavailableStatus('magic-context-rpc', observedAt),
+        magicContextDatabase: unavailableStatus('magic-context-db', observedAt),
+        openCodeDatabase: unavailableStatus('opencode-db', observedAt),
+        logTail: logStatus,
+      },
+      liveSidebar: null,
+      database: emptyDatabaseDiagnostics(),
     };
   }
-  return response;
+
+  const [live, databases] = await Promise.all([
+    directory
+      ? readLiveSidebar({ storageDir: paths.magicContextStorageDir, directory, sessionId, now })
+      : Promise.resolve({ status: noProjectStatus(now().toISOString()), sidebar: null }),
+    readDatabaseProviders({ sessionId, paths, now }),
+  ]);
+  return {
+    schemaVersion: 2,
+    observedAt,
+    sessionId,
+    sources: {
+      liveRpc: live.status,
+      magicContextDatabase: databases.magicContextStatus,
+      openCodeDatabase: databases.openCodeStatus,
+      logTail: logStatus,
+    },
+    liveSidebar: live.sidebar,
+    database: databases.database,
+  };
 };

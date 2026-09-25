@@ -4,8 +4,20 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { parseMagicContextLogLine, readDiagnostics, resolveDataPaths } from './diagnostics.js';
-import { isCurrentSessionRefresh, parseDiagnosticsResponse, preserveLastGoodLog } from '../shared.js';
+import {
+  buildSnapshot,
+  emptyDatabaseDiagnostics,
+  readDatabaseProviders,
+  resolveDataPaths,
+  type DataPaths,
+} from './diagnostics.js';
+import {
+  parseDiagnosticsResponse,
+  parseEventPage,
+  preserveLastGoodEvents,
+  type DiagnosticsResponse,
+  type EventPageDto,
+} from '../shared.js';
 
 const roots: string[] = [];
 type FixtureDatabasePaths = { magicContext: string; openCode: string };
@@ -15,7 +27,7 @@ afterEach(async () => {
 });
 
 const temporaryRoot = async (): Promise<string> => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'magic-context-extension-'));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'magic-context-extension-test-'));
   roots.push(root);
   return root;
 };
@@ -37,16 +49,13 @@ const createDatabases = (root: string): FixtureDatabasePaths => {
       materialize_reason TEXT, emergency INTEGER
     );
   `);
-  contextDb.prepare('INSERT INTO session_meta VALUES (?, ?, ?, ?, ?)').run('session-1', 'opencode', 210_000, 22.8, 922_000);
-  contextDb.prepare('INSERT INTO compartments VALUES (?, ?)').run('compartment-1', 'session-1');
-  contextDb.prepare('INSERT INTO memories VALUES (?, ?, ?)').run('memory-1', 'session-1', null);
-  contextDb.prepare('INSERT INTO pending_ops VALUES (?, ?)').run('op-1', 'session-1');
-  contextDb.prepare('INSERT INTO notes VALUES (?, ?)').run('note-1', 'session-1');
-  const decisionInsert = contextDb.prepare('INSERT INTO transform_decisions VALUES (?, ?, ?, ?, ?, ?)');
-  for (let index = 0; index < 60; index += 1) {
-    decisionInsert.run('session-1', 'opencode', `unrelated-${index}`, 'cache', 'no change', 0);
-  }
-  decisionInsert.run('session-1', 'opencode', 'message-1', 'materialize', 'context threshold', 0);
+  contextDb.prepare('INSERT INTO session_meta VALUES (?, ?, ?, ?, ?)').run('ses_fixture', 'opencode', 210_000, 22.8, 922_000);
+  contextDb.prepare('INSERT INTO compartments VALUES (?, ?)').run('compartment-1', 'ses_fixture');
+  contextDb.prepare('INSERT INTO memories VALUES (?, ?, ?)').run('memory-1', 'ses_fixture', null);
+  contextDb.prepare('INSERT INTO pending_ops VALUES (?, ?)').run('op-1', 'ses_fixture');
+  contextDb.prepare('INSERT INTO notes VALUES (?, ?)').run('note-1', 'ses_fixture');
+  contextDb.prepare('INSERT INTO transform_decisions VALUES (?, ?, ?, ?, ?, ?)')
+    .run('ses_fixture', 'opencode', 'message-1', 'materialize', 'context threshold', 0);
   contextDb.close();
 
   const openCode = path.join(root, 'opencode.db');
@@ -56,147 +65,192 @@ const createDatabases = (root: string): FixtureDatabasePaths => {
     role: 'assistant',
     tokens: { input: 300, cache: { read: 600, write: 100 }, total: 1_000 },
   });
-  openCodeDb.prepare('INSERT INTO message VALUES (?, ?, ?, ?)').run('message-1', 'session-1', Date.now(), data);
-  openCodeDb.prepare('INSERT INTO message VALUES (?, ?, ?, ?)').run('message-other', 'session-2', Date.now(), data);
-  const userMessage = JSON.stringify({ role: 'user', tokens: { input: 1, total: 1 } });
-  const userInsert = openCodeDb.prepare('INSERT INTO message VALUES (?, ?, ?, ?)');
-  userInsert.run('malformed', 'session-1', Date.now() + 1, '{malformed json');
-  for (let index = 0; index < 55; index += 1) {
-    userInsert.run(`user-${index}`, 'session-1', Date.now() + index + 1, userMessage);
-  }
+  openCodeDb.prepare('INSERT INTO message VALUES (?, ?, ?, ?)').run('message-1', 'ses_fixture', Date.now(), data);
+  openCodeDb.prepare('INSERT INTO message VALUES (?, ?, ?, ?)').run('message-other', 'ses_other', Date.now(), data);
   openCodeDb.close();
   return { magicContext, openCode };
 };
 
-describe('Magic Context diagnostics', () => {
-  test('resolves the same default storage, OpenCode, and log paths used by mcdash', () => {
+const fixtureDataPaths = (root: string, databases: FixtureDatabasePaths): DataPaths => ({
+  magicContextStorageDir: root,
+  magicContextDatabase: databases.magicContext,
+  openCodeDatabase: databases.openCode,
+  magicContextLog: path.join(root, 'magic-context.log'),
+});
+
+const sourceStatus = (source: 'magic-context-log'): DiagnosticsResponse['sources']['logTail'] => ({
+  source,
+  state: 'unknown',
+  observedAt: null,
+  freshness: 'unknown',
+  ageMs: null,
+  capabilities: [
+    { id: 'log.incremental-tail', state: 'unavailable' },
+    { id: 'log.metadata-parser', state: 'available' },
+  ],
+});
+
+describe('read-only database providers and normalized snapshots', () => {
+  test('resolves established default data paths', () => {
     assert.deepEqual(resolveDataPaths('/home/test', '/tmp'), {
-      magicContext: '/home/test/.local/share/cortexkit/magic-context/context.db',
-      openCode: '/home/test/.local/share/opencode/opencode.db',
-      log: '/tmp/opencode/magic-context/magic-context.log',
+      magicContextStorageDir: '/home/test/.local/share/cortexkit/magic-context',
+      magicContextDatabase: '/home/test/.local/share/cortexkit/magic-context/context.db',
+      openCodeDatabase: '/home/test/.local/share/opencode/opencode.db',
+      magicContextLog: '/tmp/opencode/magic-context/magic-context.log',
     });
   });
 
-  test('parses only bounded log metadata and discards log message text', () => {
-    const event = parseMagicContextLogLine(
-      '2026-09-23T12:00:00.000Z WARN magic-context: session.status stream cache.read=120 cache.write=5 tokens.input=30 prompt=private',
-    );
-    assert.deepEqual(event, {
-      at: '2026-09-23T12:00:00.000Z', level: 'warn', category: 'cache',
-      inputTokens: 30, cacheRead: 120, cacheWrite: 5,
-    });
-    assert.equal(event && 'message' in event, false);
-    assert.equal(parseMagicContextLogLine('[2026-09-23T12:00:00Z] [magic-context][session] historian completed')?.category, 'historian');
-    assert.equal(parseMagicContextLogLine('unrelated application output'), null);
-  });
-
-  test('validates service responses at the panel boundary', () => {
-    const valid = {
-      schemaVersion: 1,
-      observedAt: '2026-09-23T12:00:00.000Z',
-      log: { state: 'ready', observedAt: '2026-09-23T12:00:00.000Z', events: [] },
-    };
-    assert.deepEqual(parseDiagnosticsResponse(JSON.stringify(valid)), valid);
-    assert.equal(parseDiagnosticsResponse('{broken'), null);
-    assert.equal(parseDiagnosticsResponse(JSON.stringify({ ...valid, schemaVersion: 2 })), null);
-  });
-
-  test('does not accept an old response after switching away and back to the same session', () => {
-    const request = { sessionId: 'session-a', generation: 4 };
-    const current = { sessionId: 'session-a', generation: 6 };
-    assert.equal(isCurrentSessionRefresh(request, current), false);
-    assert.equal(isCurrentSessionRefresh(current, current), true);
-  });
-
-  test('retains last-good log events on a transient read error', () => {
-    const previous = {
-      state: 'ready' as const,
-      observedAt: '2026-09-23T12:00:00.000Z',
-      events: [{ at: '2026-09-23T11:59:59.000Z', level: 'info' as const, category: 'stream' as const, inputTokens: null, cacheRead: null, cacheWrite: null }],
-    };
-    const failed = { state: 'error' as const, observedAt: '2026-09-23T12:00:05.000Z', events: [] };
-    assert.deepEqual(preserveLastGoodLog(previous, failed), { ...previous, state: 'error' });
-    assert.deepEqual(preserveLastGoodLog(previous, { ...failed, state: 'missing' }), { ...failed, state: 'missing' });
-  });
-
-  test('returns session-scoped, read-only database metrics and sanitized log events', async () => {
+  test('returns session-scoped token usage, durable counts, and normalized transform causes read-only', async () => {
     const root = await temporaryRoot();
     const databases = createDatabases(root);
-    const log = path.join(root, 'magic-context.log');
-    await fs.writeFile(log, [
-      '2026-09-23T12:00:00.000Z INFO magic-context: cache.read=600 cache.write=100 tokens.input=300 secret prompt text',
-      '[2026-09-23T12:00:01Z] [magic-context][session-1] session.status stream completed private text',
-    ].join('\n'));
-
-    const snapshot = await readDiagnostics({
-      sessionId: 'session-1',
-      includeDatabase: true,
-      paths: { ...databases, log },
-    });
-
-    assert.deepEqual(snapshot.database?.magicContext, {
-      state: 'ready',
-      context: { inputTokens: 210_000, contextLimit: 922_000, usagePercent: 22.8 },
+    const result = await readDatabaseProviders({ sessionId: 'ses_fixture', paths: fixtureDataPaths(root, databases) });
+    assert.deepEqual(result.database.magicContext, {
       counts: { compartments: 1, memories: 1, pendingOps: 1, sessionNotes: 1 },
+      context: { inputTokens: 210_000, contextLimit: 922_000, usagePercent: 22.8 },
     });
-    const cacheEvent = snapshot.database?.openCode.cacheEvents[0];
-    assert.ok(cacheEvent);
-    assert.ok(cacheEvent.at);
-    const { at: _at, ...cacheEventValues } = cacheEvent;
-    assert.deepEqual(snapshot.database?.openCode.state, 'ready');
-    assert.deepEqual(snapshot.database?.openCode.lastInputTokens, 300);
-    assert.deepEqual(cacheEventValues, {
+    assert.equal(result.database.openCode.lastInputTokens, 300);
+    assert.equal(result.database.openCode.cacheEvents.length, 1);
+    const cacheEvent = result.database.openCode.cacheEvents[0];
+    assert.ok(cacheEvent?.at && Number.isFinite(Date.parse(cacheEvent.at)));
+    assert.deepEqual({
+      inputTokens: cacheEvent?.inputTokens,
+      cacheRead: cacheEvent?.cacheRead,
+      cacheWrite: cacheEvent?.cacheWrite,
+      totalTokens: cacheEvent?.totalTokens,
+      hitRatio: cacheEvent?.hitRatio,
+      cause: cacheEvent?.cause,
+    }, {
       inputTokens: 300, cacheRead: 600, cacheWrite: 100, totalTokens: 1_000, hitRatio: 2 / 3, cause: 'materialized',
     });
-    assert.deepEqual(snapshot.log.events.map((event) => event.category), ['cache', 'stream']);
-    assert.equal(JSON.stringify(snapshot).includes('secret prompt'), false);
-    assert.equal(JSON.stringify(snapshot).includes('private text'), false);
+    assert.equal(result.magicContextStatus.state, 'ready');
+    assert.equal(result.openCodeStatus.state, 'ready');
 
     const verifyContext = new DatabaseSync(databases.magicContext, { readOnly: true });
     assert.equal(verifyContext.prepare('SELECT COUNT(*) AS count FROM memories').get()?.count, 1);
     assert.throws(() => verifyContext.exec('DELETE FROM memories'));
     verifyContext.close();
-
     const verifyOpenCode = new DatabaseSync(databases.openCode, { readOnly: true });
-    assert.equal(verifyOpenCode.prepare('SELECT COUNT(*) AS count FROM message WHERE session_id = ?').get('session-1')?.count, 57);
+    assert.equal(verifyOpenCode.prepare('SELECT COUNT(*) AS count FROM message WHERE session_id = ?').get('ses_fixture')?.count, 1);
     assert.throws(() => verifyOpenCode.exec('DELETE FROM message'));
     verifyOpenCode.close();
   });
 
-  test('reports missing files instead of treating them as empty successful data', async () => {
+  test('does not return other sessions cache events when no session is selected', async () => {
     const root = await temporaryRoot();
-    const snapshot = await readDiagnostics({
-      sessionId: null,
-      includeDatabase: true,
-      paths: {
-        magicContext: path.join(root, 'missing-context.db'),
-        openCode: path.join(root, 'missing-opencode.db'),
-        log: path.join(root, 'missing.log'),
-      },
-    });
-    assert.equal(snapshot.database?.magicContext.state, 'missing');
-    assert.equal(snapshot.database?.openCode.state, 'missing');
-    assert.equal(snapshot.log.state, 'missing');
-    assert.deepEqual(snapshot.database?.openCode.cacheEvents, []);
+    const databases = createDatabases(root);
+    const result = await readDatabaseProviders({ sessionId: null, paths: fixtureDataPaths(root, databases) });
+    assert.deepEqual(result.database.openCode.cacheEvents, []);
+    assert.equal(result.database.openCode.lastInputTokens, null);
+    assert.equal(result.openCodeStatus.state, 'partial');
   });
 
-  test('reports unknown database layouts as partial, not successful empty diagnostics', async () => {
+  test('marks assistant rows without recognized usage fields partial instead of empty success', async () => {
     const root = await temporaryRoot();
     const magicContext = path.join(root, 'context.db');
     const openCode = path.join(root, 'opencode.db');
     new DatabaseSync(magicContext).close();
-    new DatabaseSync(openCode).close();
-    const log = path.join(root, 'magic-context.log');
-    await fs.writeFile(log, '');
-
-    const snapshot = await readDiagnostics({
-      sessionId: null,
-      includeDatabase: true,
-      paths: { magicContext, openCode, log },
+    const db = new DatabaseSync(openCode);
+    db.exec('CREATE TABLE message (id TEXT, session_id TEXT, time_created INTEGER, data TEXT)');
+    db.prepare('INSERT INTO message VALUES (?, ?, ?, ?)')
+      .run('assistant-1', 'ses_fixture', Date.now(), JSON.stringify({ role: 'assistant', text: 'not returned' }));
+    db.close();
+    const result = await readDatabaseProviders({
+      sessionId: 'ses_fixture',
+      paths: fixtureDataPaths(root, { magicContext, openCode }),
     });
-    assert.equal(snapshot.database?.magicContext.state, 'partial');
-    assert.equal(snapshot.database?.openCode.state, 'partial');
-    assert.equal(snapshot.log.state, 'ready');
-    assert.equal(snapshot.log.events.length, 0);
+    assert.equal(result.openCodeStatus.state, 'partial');
+    assert.equal(result.openCodeStatus.capabilities[0].state, 'partial');
+    assert.deepEqual(result.database.openCode.cacheEvents, []);
+  });
+
+  test('reports missing files and unsupported schemas instead of an authoritative empty snapshot', async () => {
+    const root = await temporaryRoot();
+    const missingPaths: DataPaths = {
+      magicContextStorageDir: root,
+      magicContextDatabase: path.join(root, 'missing-context.db'),
+      openCodeDatabase: path.join(root, 'missing-opencode.db'),
+      magicContextLog: path.join(root, 'missing.log'),
+    };
+    const missing = await readDatabaseProviders({ sessionId: null, paths: missingPaths });
+    assert.equal(missing.magicContextStatus.state, 'missing');
+    assert.equal(missing.openCodeStatus.state, 'missing');
+    assert.deepEqual(missing.database, emptyDatabaseDiagnostics());
+
+    const context = path.join(root, 'unknown-context.db');
+    const openCode = path.join(root, 'unknown-opencode.db');
+    new DatabaseSync(context).close();
+    new DatabaseSync(openCode).close();
+    const unknown = await readDatabaseProviders({
+      sessionId: null,
+      paths: { ...missingPaths, magicContextDatabase: context, openCodeDatabase: openCode },
+    });
+    assert.equal(unknown.magicContextStatus.state, 'partial');
+    assert.equal(unknown.openCodeStatus.state, 'partial');
+  });
+
+  test('reports runtimes without SQLite as unsupported without touching database paths', async () => {
+    const root = await temporaryRoot();
+    const paths: DataPaths = {
+      magicContextStorageDir: root,
+      magicContextDatabase: path.join(root, 'unread-context.db'),
+      openCodeDatabase: path.join(root, 'unread-opencode.db'),
+      magicContextLog: path.join(root, 'unused.log'),
+    };
+    const result = await readDatabaseProviders({ sessionId: 'ses_fixture', paths, sqlite: null });
+    assert.equal(result.magicContextStatus.state, 'unsupported');
+    assert.equal(result.openCodeStatus.state, 'unsupported');
+    assert.equal(result.magicContextStatus.capabilities[0].state, 'unsupported');
+    assert.deepEqual(result.database, emptyDatabaseDiagnostics());
+    await assert.rejects(fs.stat(paths.magicContextDatabase), { code: 'ENOENT' });
+  });
+
+  test('marks malformed server configuration unavailable rather than using default files', async () => {
+    const root = await temporaryRoot();
+    const snapshot = await buildSnapshot({
+      sessionId: null,
+      directory: null,
+      paths: {
+        magicContextStorageDir: root,
+        magicContextDatabase: path.join(root, 'never-read.db'),
+        openCodeDatabase: path.join(root, 'never-read-opencode.db'),
+        magicContextLog: path.join(root, 'never-read.log'),
+      },
+      logStatus: sourceStatus('magic-context-log'),
+      configurationValid: false,
+    });
+    assert.equal(snapshot.sources.liveRpc.state, 'error');
+    assert.equal(snapshot.sources.magicContextDatabase.state, 'error');
+    assert.equal(snapshot.sources.openCodeDatabase.state, 'error');
+    assert.equal(snapshot.liveSidebar, null);
+    assert.deepEqual(snapshot.database, emptyDatabaseDiagnostics());
+    assert.equal(parseDiagnosticsResponse(JSON.stringify(snapshot))?.schemaVersion, 2);
+    assert.equal(parseDiagnosticsResponse(JSON.stringify({ ...snapshot, schemaVersion: 1 })), null);
+  });
+
+  test('validates event pages and preserves previous events with explicit stale state on failure', () => {
+    const previous: EventPageDto = {
+      schemaVersion: 1,
+      observedAt: '2026-09-26T12:00:00.000Z',
+      source: {
+        source: 'magic-context-log', state: 'ready', observedAt: '2026-09-26T12:00:00.000Z', freshness: 'fresh', ageMs: 0,
+        capabilities: [{ id: 'log.incremental-tail', state: 'available' }, { id: 'log.metadata-parser', state: 'available' }],
+      },
+      cursor: 'AAAAAAAAAAAAAAAAAAAAAAAA',
+      events: [{ id: 'event-1', at: null, level: 'info', category: 'transform', inputTokens: null, cacheRead: null, cacheWrite: null }],
+      gaps: [],
+      retainedEvents: 1,
+    };
+    const failed: EventPageDto = {
+      ...previous,
+      observedAt: '2026-09-26T12:00:05.000Z',
+      source: { ...previous.source, state: 'error', freshness: 'unknown' },
+      events: [],
+      gaps: ['source-unavailable'],
+    };
+    const parsed = parseEventPage(JSON.stringify(previous));
+    assert.deepEqual(parsed, previous);
+    const retained = preserveLastGoodEvents(previous, failed);
+    assert.equal(retained.events.length, 1);
+    assert.equal(retained.source.freshness, 'stale');
   });
 });
